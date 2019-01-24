@@ -1,0 +1,912 @@
+<html>
+  <head>
+  <!-- sztuczna kamery swiatla obroty-->
+<script type="text/javascript" src="js/three.js"></script>
+<script type="text/javascript" src="js/OrbitAndPanControls.js"></script>
+<!-- możliwość używania jeisona wyglad-->
+<script src="js/jquery-1.9.1.js"></script>
+<script src="js/jquery-ui-1.10.3.custom.js"></script>
+<!-- sztuczna inteligencja-->
+<script type="text/javascript" src="js/garbochess.js"></script>
+
+<script type="text/javascript">
+
+var camera;
+var validMoves = null;
+var g_allMoves = [];
+var promotion = moveflagPromoteQueen;
+
+var g_playerWhite = false;
+var g_backgroundEngine;
+/*kamera kierunki swiatlo kontrola kamery render stolu */
+(function() {
+	var scene, renderer;
+	var cameraControls, effectController;
+	var projector;
+	var chessBoard;
+	var clock = new THREE.Clock();
+
+	var g_backgroundEngineValid = true;
+	var board3D = [];
+	var selectedPiece = null;
+	var selectedCell = null;
+
+	g_timeout = 1600;
+	g_maxply  = 49;
+
+	function init() {
+
+		var canvasWidth  = window.innerWidth;
+		var canvasHeight = window.innerHeight;
+		var canvasRatio  = canvasWidth / canvasHeight;
+
+		renderer = new THREE.WebGLRenderer( { antialias: true } );
+		renderer.gammaInput = true;
+		renderer.gammaOutput = true;
+		renderer.setSize(canvasWidth, canvasHeight);
+
+		renderer.setClearColor( 0x000000, 1.0 );
+		document.body.appendChild( renderer.domElement );
+
+		camera = new THREE.PerspectiveCamera( 45, canvasRatio, 1, 40000 );
+		cameraControls = new THREE.OrbitAndPanControls(camera, renderer.domElement);
+		cameraControls.minPolarAngle = 0;
+		cameraControls.maxPolarAngle = 80 * Math.PI/180;
+		cameraControls.minDistance   = 10;
+		cameraControls.maxDistance   = 200;
+		cameraControls.userZoomSpeed = 1.0;
+		camera.position.set( 0, 100, 100 );
+
+		var spotlight = new THREE.SpotLight( 0xFFFFFF, 1.0);
+		spotlight.position.set( 0, 300, 0 );
+		spotlight.angle =  Math.PI / 2;
+		spotlight.exponent = 50.0;
+		spotlight.target.position.set( 0, 0, 0 );
+
+		var whiteLight = new THREE.PointLight( 0xFFEEDD, 0.2);
+		whiteLight.position.set(0,0,100);
+		var blackLight = new THREE.PointLight( 0xFFEEDD, 0.2);
+		blackLight.position.set(0,0,-100);
+
+		initPieceFactory();
+		initCellFactory();
+
+		chessBoard = createChessBoard(BOARD_SIZE);
+		var floor = createFloor(FLOOR_SIZE,BOARD_SIZE);
+
+		floor.position.y = chessBoard.height;
+
+		scene = new THREE.Scene();
+		scene.add(floor);
+		scene.add(spotlight);
+		scene.add(whiteLight);
+		scene.add(blackLight);
+		scene.add(chessBoard);
+		scene.fog = new THREE.FogExp2( 0x000000, 0.001 );
+		scene.add(new THREE.AmbientLight(0x330000));
+
+		projector = new THREE.Projector();
+
+		createValidCellMaterial();
+		createSelectedMaterial();
+
+		document.addEventListener( 'mousedown', onDocumentMouseDown, false );
+		document.addEventListener( 'mousemove', onDocumentMouseMove, false );
+		window.addEventListener('resize',onResize,false);
+	}
+
+	function onResize() {
+		var canvas = renderer.domElement;
+		var w = window.innerWidth;
+		var h = window.innerHeight;
+		renderer.setSize(w,h);
+		camera.aspect = w/h;
+		camera.updateProjectionMatrix();
+	}
+
+	function animate() {
+		window.requestAnimationFrame(animate);
+		render();
+	}
+
+	function render() {
+		var delta = clock.getDelta();
+		cameraControls.update(delta);
+		renderer.render(scene, camera);
+	}
+//ruch przeciwnika
+	function UIPlayMove(move,silent) {
+		g_allMoves[g_allMoves.length] = move;
+		MakeMove(move);
+		if(!silent) {
+			redrawBoard();
+		}
+	}
+//ruch pionka
+	function playMove(piece,cell) {
+
+		if (piece.cell === undefined || cell.name === undefined) {
+			return false;
+		}
+
+		var start = new Cell(piece.cell);
+		var end   = new Cell(cell.name);
+
+		var startSquare = MakeSquare(start.y, start.x);
+		var endSquare   = MakeSquare(end.y, end.x);
+
+		var move = null;
+		var testPromotion = false;
+		var p = g_board[startSquare];
+
+		if ( ((p & 0x7) === piecePawn) &&
+				(((start.y === 1) && g_playerWhite) ||
+				( (start.y === 6) && !g_playerWhite)) &&
+				(((p & 0x8) &&  g_playerWhite) ||
+				(!(p & 0x8) && !g_playerWhite))
+			) {
+			testPromotion = true;
+		}
+
+		for (var i = 0; i < validMoves.length; i++) {
+			if (testPromotion) {
+				if(validMoves[i] === GenerateMove(startSquare, endSquare, moveflagPromotion | promotion)) {
+					move = validMoves[i];
+					break;
+				}
+			} else {
+				if ( (validMoves[i] & 0xFF)       == startSquare &&
+					((validMoves[i] >> 8) & 0xFF) == endSquare ) {
+					move = validMoves[i];
+					break;
+				}
+			}
+		}
+
+
+		if (!(start.x === end.x && start.y === end.y) && move !== null) {
+			if (InitializeBackgroundEngine()) {
+				g_backgroundEngine.postMessage(FormatMove(move));
+			}
+
+			UIPlayMove(move,false);
+			setTimeout(SearchAndRedraw, 0);
+			return true;
+		}
+		return false;
+	}
+//ruch przeciwnika znajdowanie
+	function SearchAndRedraw() {
+		if (InitializeBackgroundEngine()) {
+			g_backgroundEngine.postMessage("search " + g_timeout + "," + g_maxply);
+		} else {
+			Search(FinishMove, g_maxply, null); 
+		}
+	}
+
+	function FinishMove(bestMove, value, timeTaken, ply) {
+		if (bestMove !== null) {
+			UIPlayMove(bestMove,false);
+		}
+	}
+//wczytanie ruchu
+	function InitializeBackgroundEngine() {
+		if (!g_backgroundEngineValid) {
+			return false;
+		}
+		if (!g_backgroundEngine) {
+			g_backgroundEngineValid = true;
+			try {
+				g_backgroundEngine = new Worker("js/garbochess.js");
+				g_backgroundEngine.onmessage = function (e) {
+					if (e.data.match("^pv") == "pv") {
+					} else if (e.data.match("^message") == "message") {
+					} else if (e.data.match("^console: ") == "console: ") {
+						console.log(e.data.substr(9));
+					} else {
+						UIPlayMove(GetMoveFromString(e.data), false);
+					}
+				};
+				g_backgroundEngine.error = function (e) {
+					alert("Error from background worker:" + e.message);
+				};
+				g_backgroundEngine.postMessage("position " + GetFen());
+			} catch (error) {
+				g_backgroundEngineValid = false;
+			}
+		}
+		return g_backgroundEngineValid;
+	}
+//tworzenie elementow
+	function updateBoard3D() {
+		board3D = [];
+		for (var y = 0; y < ROWS; y++) {
+			for (var x = 0; x < COLS; x++) {
+				var piece = g_board[MakeSquare(y,x)];
+				var pieceColor = (piece & colorWhite) ? WHITE : BLACK;
+				var pieceName = null;
+				switch (piece & 0x7) {
+				case piecePawn:
+					pieceName = "pawn";
+					break;
+				case pieceKnight:
+					pieceName = "knight";
+					break;
+				case pieceBishop:
+					pieceName = "bishop";
+					break;
+				case pieceRook:
+					pieceName = "rook";
+					break;
+				case pieceQueen:
+					pieceName = "queen";
+					break;
+				case pieceKing:
+					pieceName = "king";
+					break;
+				}
+
+				if (pieceName !== null) {
+					board3D[x+y*COLS] = createPiece(pieceName,pieceColor);
+				}
+			}
+		}
+	}
+
+	function clearBoard() {
+		var cell;
+		board3D.forEach(function(piece) {
+			scene.remove(piece);
+			cell = new Cell(piece.cell);
+		});
+	}
+
+	function fillBoard() {
+		var cell;
+		board3D.forEach(function(piece,index) {
+			cell = new Cell(index);
+			piece.position = cell.getWorldPosition();
+			piece.cell = index;
+			scene.add(piece);
+		});
+	}
+
+	function redrawBoard() {
+		validMoves = GenerateValidMoves();
+		clearBoard();
+		updateBoard3D();
+		fillBoard();
+	}
+
+	function pickPiece(raycaster) {
+		var intersect   = null;
+		var picked = null;
+		var hitList = [];
+		var hit,piece;
+		for (var i in board3D) {
+			if ({}.hasOwnProperty.call(board3D, i)) {
+				piece     = board3D[i];
+				intersect = raycaster.intersectObject( piece.children[0], true );
+
+				if (intersect.length > 0) {
+					hit = intersect[0];
+					if (( g_playerWhite && hit.object.parent.color === WHITE ) ||
+						(!g_playerWhite && hit.object.parent.color === BLACK ) ){
+						hitList.push(hit);
+					}
+				}
+			}
+		}
+
+		hitList.forEach(function(hit) {
+			if (picked === null || picked.distance > hit.distance) {
+				picked = hit;
+			}
+		});
+
+		if (picked) {
+			return picked.object.parent;
+		} else {
+			return null;
+		}
+	}
+
+	function pickCell(raycaster) {
+		var intersect = raycaster.intersectObject( chessBoard, true );
+		if (intersect.length > 0) {
+			var pickedCell = intersect[0].object;
+			return pickedCell;
+		}
+		return null;
+	}
+
+	function getRay(event) {
+		var zoomLevel = window.devicePixelRatio | 1.0 ;
+		var canvas = renderer.domElement;
+		var canvasPosition = canvas.getBoundingClientRect();
+		var mouseX = event.clientX*zoomLevel - canvasPosition.left;
+		var mouseY = event.clientY*zoomLevel - canvasPosition.top;
+
+		var mouseVector = new THREE.Vector3(
+			2 * ( mouseX / canvas.width ) - 1,
+			1 - 2 * ( mouseY / canvas.height ));
+
+		return projector.pickingRay( mouseVector.clone(), camera );
+	}
+
+	function onDocumentMouseMove( event ) {
+
+		var canvas = renderer.domElement;
+		var raycaster   = getRay(event);
+		var pickedPiece = pickPiece(raycaster);
+		var pickedCell  = pickCell(raycaster);
+
+		canvas.style.cursor = "default";
+		if (pickedPiece !== null) {
+			canvas.style.cursor = "pointer";
+		}
+
+		if (selectedCell !== null) {
+			selectedCell.material = selectedCell.baseMaterial;
+		}
+
+		if(selectedPiece !== null && pickedCell !== null) {
+			var start = new Cell(selectedPiece.cell);
+			var end   = new Cell(pickedCell.name);
+
+			var move = null;
+			for (var i = 0; i < validMoves.length; i++) {
+				if ( (validMoves[i] & 0xFF)       == MakeSquare(start.y, start.x) &&
+					((validMoves[i] >> 8) & 0xFF) == MakeSquare(end.y, end.x)
+					) {
+					move = validMoves[i];
+					break;
+				}
+			}
+
+			if (pickedCell !== null && move !==null) {
+				selectedCell = pickedCell;
+				selectedCell.baseMaterial = selectedCell.material;
+				selectedCell.material = validCellMaterial[selectedCell.color];
+				canvas.style.cursor = "pointer";
+			}
+		}
+
+	}
+
+	function onDocumentMouseDown( event ) {
+
+		var canvas = renderer.domElement;
+		var raycaster = getRay(event);
+
+		var pickedPiece = pickPiece(raycaster);
+		var pickedCell  = pickCell(raycaster);
+
+		if (selectedPiece !== null && pickedCell !== null) {
+			if(playMove(selectedPiece,pickedCell)) {
+				selectedPiece = null;
+				pickedPiece   = null;
+				pickedCell    = null;
+			}
+		}
+
+		if (selectedPiece !== null) {
+			selectedPiece.children[0].material = selectedPiece.baseMaterial;
+		}
+
+		selectedPiece = pickedPiece;
+		if (selectedPiece !== null) {
+			selectedPiece.baseMaterial = selectedPiece.children[0].material;
+			selectedPiece.children[0].material = selectedMaterial[selectedPiece.color];
+		}
+	}
+
+
+	function newGame(color) {
+		ResetGame();
+		
+		g_allMoves = [];
+		redrawBoard();
+
+		if (color === WHITE) {
+			g_playerWhite = true;
+			camera.position.x = 0;
+			camera.position.z = 100; 
+		} else {
+			g_playerWhite = false;
+			camera.position.x = 0;
+			SearchAndRedraw();
+			camera.position.z = -100; 
+		}
+	}
+	
+	function onLoaded () {
+		init();
+		newGame(WHITE);
+		animate();
+	}
+
+	window.onLoaded = onLoaded;
+})();
+var WIREFRAME = false;
+var BLACK = 0;
+var WHITE = 1;
+var FEEDBACK = 2;
+var DEBUG = false;
+var BOARD_SIZE = 100;
+var PIECE_SIZE = 0.4;
+var FLOOR_SIZE = 2000;
+var COLS = 8;
+var ROWS = 8;
+var LOADING_BAR_SCALE = 0.3;
+var geometries = {};
+var textures   = {};
+var geometries = {};
+var textures = {};
+
+/*tworzenie i kolory ruchu zaznaczanie i mozliwosci ruchu*/
+(function () {
+	var a = "a".charCodeAt(0);
+	function Cell() {
+		this.position = null;
+		this.index    = null;
+		this.x = null;
+		this.y = null;
+		var coordinates = null;
+		if( arguments.length === 1) {
+
+			if (typeof(arguments[0]) === "string" && arguments[0].match(/[a-h][1-8]/) ) {
+				this.position = arguments[0];
+				coordinates = getCoordinatesFromPosition(
+					this.position
+				);
+				this.x = coordinates.x;
+				this.y = coordinates.y;
+				this.index = this.x + this.y * COLS;
+			} else if (arguments[0] >= 0 && arguments[0] < ROWS*COLS) {
+				this.index = arguments[0];
+				coordinates = getCoordinatesFromIndex(
+					this.index
+				);
+				this.x = coordinates.x;
+				this.y = coordinates.y;
+				this.position = getPositionFromCoordinates(
+					this.x,this.y
+				);
+			}
+		} else if(  arguments.length === 2 &&
+					isValid(arguments[0],arguments[1]) ) {
+			this.x = arguments[0];
+			this.y = arguments[1];
+			this.index = this.x + this.y * COLS;
+			this.position = getPositionFromCoordinates(
+				this.x,this.y
+			);
+		} else {
+			throw arguments[0];
+		}
+	}
+
+	Cell.prototype.toString = function() {
+		return this.position;
+	};
+
+	Cell.prototype.equals = function () {
+		if(arguments.length === 1) {
+			var cell = arguments[0];
+			if(cell instanceof Cell) {
+				return cell.position === this.position;
+			} else {
+				return cell === this.position;
+			}
+		} else if (arguments.length === 2) {
+			return  this.x === arguments[0] &&
+					this.y === arguments[1];
+		}
+
+	};
+
+	Cell.prototype.getWorldPosition = function() {
+		var cs = BOARD_SIZE / ROWS;
+		var middle = (BOARD_SIZE-cs)/2;
+
+
+		return new THREE.Vector3(
+			this.x * cs - middle,
+			0,
+			(this.y * cs - middle)
+		);
+	};
+
+	function getPositionFromCoordinates(x,y) {
+		return String.fromCharCode(x+a)+(7-y+1);
+	}
+
+	function getCoordinatesFromPosition(position) {
+		return {
+			x: position.charCodeAt(0) - a,
+			y: 7-(parseInt(position.charAt(1),10)-1)
+		};
+	}
+
+	function getCoordinatesFromIndex(index) {
+		return {
+			x: index%COLS,
+			y: Math.floor(index/COLS) 
+		};
+	}
+
+	function isValid() {
+		if( arguments.length == 2) {
+			var x = arguments[0];
+			var y = arguments[1];
+
+			return  x >= 0 && x < COLS &&
+					y >= 0 && y < ROWS;
+		}
+		return false;
+	}
+
+	window.Cell = Cell;
+
+})();
+
+function initPieceFactory () {
+
+	var tiling = 4;
+	var colors = [];
+	for(var c = 0; c<2; c++) {
+		colors[c] = textures['texture/glass-'+c+'.jpg'].clone();
+		colors[c].tile(tiling);
+	}
+
+	function createPiece(name,color) {
+		var size = BOARD_SIZE/COLS * PIECE_SIZE;
+		var piece = new THREE.Object3D();
+		var material = new THREE.MeshPhongMaterial({
+			color:0xffffff,
+			specular:0xaaaaaa,
+			shininess:60.0,
+			map:colors[color],
+			wireframe:WIREFRAME
+		});
+		material.normalScale.set(0.3,0.3);
+
+		var urlJson = '3D/'+name+'.json';
+		var urlAO   = 'texture/'+name+'-ao.jpg';
+
+		var geo = geometries[urlJson];
+		var light = textures[urlAO];
+		light.format = THREE.LuminanceFormat;
+
+		material.lightMap = light;
+
+		var mesh  = new THREE.Mesh(geo,material);
+		
+		mesh.scale.set(size,size,size);
+		mesh.rotation.y += (color == WHITE) ? -Math.PI/2 : Math.PI/2;
+
+		var reflexion = mesh.clone();
+		reflexion.scale.y *= -1;
+		reflexion.material = reflexion.material.clone();
+		reflexion.material.side = THREE.BackSide;
+
+		piece.add(mesh);
+		piece.add(reflexion);
+
+		piece.name = name;
+		piece.color = color;
+
+		return piece;
+	}
+
+	window.createPiece = createPiece;
+}
+
+function initCellFactory() {
+
+	var materials = [];
+	var tiling = 2;
+	var diff;
+
+	for(var c = 0; c<2; c++) {
+		diff = textures['texture/glass-'+c+'.jpg'].clone();
+		diff.tile(tiling);
+		materials[c] =  new THREE.MeshPhongMaterial({
+			color:0xffffff,
+			specular:[0xAAAAAA,0x444444][c],
+			shininess:30.0,
+			wireframe:WIREFRAME,
+			transparent:true,
+			map:diff,
+			opacity:0.5
+		});
+	}
+
+	function createCell(size,color) {
+		var geo = new THREE.PlaneGeometry(size,size);
+		var randU = Math.random();
+		var randV = Math.random();
+		var uvs = geo.faceVertexUvs[0][0];
+		for (var j = 0; j < uvs.length; j++) {
+			uvs[j].x += randU;
+			uvs[j].y += randV;
+		}
+
+		var cell = new THREE.Mesh(geo,materials[color]);
+		cell.rotation.x = -Math.PI/2;
+		cell.color = color;
+		return cell;
+	}
+
+	window.createCell = createCell;
+}
+/*tekstury planszy*/
+function createChessBoard(size) {
+	var lChessBoard = new THREE.Object3D();
+
+	var cellSize = size/COLS;
+	var square,cell;
+
+	for(var i=0; i< ROWS*COLS; i++) {
+
+		var col = i%COLS;
+		var row = Math.floor(i/COLS);
+
+		cell = new Cell(i);
+		square = createCell(cellSize,1-(i+row)%2);
+		square.position = cell.getWorldPosition();
+		square.name = cell.position;
+
+		lChessBoard.add(square);
+	}
+
+	var innerBoard = new THREE.Mesh (
+		geometries['3D/innerBoard.json'],
+		new THREE.MeshBasicMaterial({
+			color:0x783e12
+		})
+	);
+	innerBoard.scale.set(size,size,size);
+
+	var tiling = 6;
+	var glass = textures['texture/glass-0.jpg'].clone();
+	glass.tile(tiling);
+
+	var geo = geometries['3D/board.json'];
+	geo.computeBoundingBox();
+
+	var board = new THREE.Mesh (
+		geo,
+		new THREE.MeshPhongMaterial({
+			color:0xffffff,
+			map:glass,
+			specular: 0xffffff,
+			shininess: 60,
+			normalScale: new THREE.Vector2(0.2,0.2)
+		})
+	);
+	var hCorrection = 0.62; 
+	board.scale.set(size,size*hCorrection,size);
+	lChessBoard.height = geo.boundingBox.min.y * board.scale.y;
+	lChessBoard.add(innerBoard);
+	lChessBoard.add(board);
+	lChessBoard.name = "chessboard";
+	return lChessBoard;
+}
+/*tekstury dla podłoza*/
+function createFloor(size,chessboardSize) {
+	var tiling = 30*size/1000;
+	var material = new THREE.MeshPhongMaterial({
+		color:0xffffff,
+		wireframe:WIREFRAME	,
+		specular:0xaaaaaa,
+		shininess:30
+	});
+	var diff  = textures['texture/floor.jpg'];
+
+	diff.tile(tiling);
+
+	material.map = diff;
+	material.normalScale.set(0.6,0.6);
+
+	var halfBoard = chessboardSize/2;
+	var halfSize  = size/2;
+
+	var floorGeo = new THREE.Geometry();
+	floorGeo.vertices.push(new THREE.Vector3(-halfSize,0,-halfSize));
+	floorGeo.vertices.push(new THREE.Vector3( halfSize,0,-halfSize));
+	floorGeo.vertices.push(new THREE.Vector3( halfSize,0, halfSize));
+	floorGeo.vertices.push(new THREE.Vector3(-halfSize,0, halfSize));
+	floorGeo.vertices.push(new THREE.Vector3(-halfBoard,0,-halfBoard));
+	floorGeo.vertices.push(new THREE.Vector3( halfBoard,0,-halfBoard));
+	floorGeo.vertices.push(new THREE.Vector3( halfBoard,0, halfBoard));
+	floorGeo.vertices.push(new THREE.Vector3(-halfBoard,0, halfBoard));
+	floorGeo.faceVertexUvs[ 0 ] = [];
+	floorGeo.faceVertexUvs[ 1 ] = [];
+
+	var normal = new THREE.Vector3( 0, 1, 0 );
+	var faces = [
+		[0,4,5,1],
+		[1,5,6,2],
+		[2,6,7,3],
+		[3,7,4,0]
+	];
+
+	faces.forEach( function(f) {
+		var uvs1 = [];
+		var uvs2 = [];
+		var lightU,lightV;
+		f.forEach(function(v,i) {
+			uvs1.push(new THREE.Vector2(
+				(floorGeo.vertices[v].x+halfSize)/size,
+				(floorGeo.vertices[v].z+halfSize)/size
+			));
+			lightU = (v < 4) ? 80 : 0;
+			lightV = (i < 2) ? 0 : 1;
+			uvs2.push(new THREE.Vector2(lightU,lightV));
+		});
+
+		var face = new THREE.Face4(
+			f[0],f[1],f[2],f[3]
+		);
+
+		face.normal.copy( normal );
+		face.vertexNormals.push(
+			normal.clone(),
+			normal.clone(),
+			normal.clone(),
+			normal.clone()
+		);
+
+		floorGeo.faces.push(face);
+		floorGeo.faceVertexUvs[ 0 ].push(uvs1); 
+		floorGeo.faceVertexUvs[ 1 ].push(uvs2); 
+	});
+
+	floorGeo.computeCentroids();
+
+	var floor = new THREE.Mesh(floorGeo,material);
+	floor.name = "floor";
+	return floor;
+}
+/*tekstury dla pionkow*/
+var validCellMaterial = null;
+function createValidCellMaterial () {
+	validCellMaterial = [];
+	var tiling = 2;
+	var diff;
+
+	for(var c = 0; c<2; c++) {
+
+		diff = textures['texture/glass-1.jpg'].clone();
+		diff.tile(tiling);
+
+		validCellMaterial[c] =  new THREE.MeshPhongMaterial({
+			color:0x00ff00,
+			specular:0x999999,
+			shininess:60.0,
+			wireframe:WIREFRAME,
+			map:diff,
+		});
+	}
+}
+/*tekstury dla pionkow*/
+var selectedMaterial = null;
+function createSelectedMaterial() {
+	selectedMaterial = [];
+	var tiling = 4;
+	var diff;
+
+	for(var c = 0; c<2; c++) {
+		diff = textures['texture/glass-1.jpg'].clone();
+		diff.tile(tiling);
+		selectedMaterial[c] =  new THREE.MeshPhongMaterial({
+			color:0x00ff00,
+			emissive:0x009900,
+			specular:0x999999,
+			shininess:60.0,
+			wireframe:WIREFRAME,
+			transparent:false,
+			map:diff
+		});
+		selectedMaterial[c].normalScale.set(0.3,0.3);
+	}
+}
+
+/*tekstury ladowanie*/
+(function() {
+	var $bar;
+	function loadResources () {
+		var loaded = 0;
+		var resources = [
+			'3D/knight.json',
+			'3D/king.json',
+			'3D/queen.json',
+			'3D/bishop.json',
+			'3D/rook.json',
+			'3D/pawn.json',
+			'3D/board.json',
+			'3D/innerBoard.json',
+			'texture/glass-0.jpg',
+			'texture/glass-1.jpg',
+			'texture/knight-ao.jpg',
+			'texture/rook-ao.jpg',
+			'texture/king-ao.jpg',
+			'texture/bishop-ao.jpg',
+			'texture/queen-ao.jpg',
+			'texture/pawn-ao.jpg',
+			'texture/floor.jpg'
+		];
+
+		function loadJSON (url) {
+			var loader = new THREE.JSONLoader();
+			loader.load(url, function(geometry) {
+
+				geometries[url] = geometry;
+
+				loaded++;
+				checkLoad();
+			});
+		}
+
+		function loadImage(url) {
+			THREE.ImageUtils.loadTexture(
+				url,
+				THREE.UVMapping(),
+				function(texture) {
+					textures[url] = texture;
+					loaded++;
+					checkLoad();
+				}
+			);
+		}
+
+		resources.forEach(function(url) {
+			switch ( url.split('.').pop() ) {
+			case 'json' :
+				loadJSON(url);
+				break;
+			case 'jpg' :
+				loadImage(url);
+				break;
+			default:
+				throw 'invalid resource';
+			}
+		});
+
+		function checkLoad () {
+			$bar.update(loaded/resources.length);
+			if (loaded === resources.length) {
+				setTimeout(onLoaded,0.1);
+			}
+		}
+	}
+
+	function initBar() {
+		$bar = $('<div>')
+			.css("width",(LOADING_BAR_SCALE*100)+"%")
+			.appendTo($('body'));
+
+		var $label = $('<div>')
+			.attr("id","progress-label")
+			.appendTo($bar);
+			
+		$bar.removeClass('ui-corner-all');
+		$bar.children().removeClass('ui-corner-all');
+		$bar.children().removeClass('ui-corner-left');
+		$bar.update = function(p) {
+			p = Math.round(p*100);
+			$bar.children().removeClass('ui-corner-right');
+		};
+		$bar.update(0);
+	}
+
+	window.onload = function () {			
+		initBar();
+		loadResources();
+	};
+})();
+</script>
+  </head>
+</html>
